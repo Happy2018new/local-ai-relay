@@ -1,10 +1,8 @@
 package tui
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -84,12 +82,15 @@ func renderLogRow(entry logEntry, row int, selected bool, width, offset int, raw
 	prefix := paint(fmt.Sprintf("%s%5d  ", marker, row), "244", selected)
 	var body string
 	if raw {
-		body = cleanLogText(entry.raw)
+		body = paint(cleanLogText(entry.raw), "117", selected)
 	} else {
 		values := logValues(entry.data)
 		var fields []string
 		for i, c := range logColumns {
 			color := c.color
+			if i == 2 {
+				color = eventColor(entry.data)
+			}
 			if i == 1 || i == len(logColumns)-1 {
 				switch entry.data["level"] {
 				case "WARN":
@@ -103,6 +104,68 @@ func renderLogRow(entry logEntry, row int, selected bool, width, offset int, raw
 		body = strings.Join(fields, "")
 	}
 	return ansi.Truncate(prefix+ansi.Cut(body, offset, offset+max(0, width-8)), width, "")
+}
+
+func eventColor(data map[string]any) string {
+	switch data["msg"] {
+	case "relay_started":
+		return "43"
+	case "relay_stopped":
+		return "244"
+	case "request_received":
+		return "75"
+	case "upstream_response":
+		if number(data["status"]) >= 400 {
+			return statusColor(data["status"])
+		}
+		return "45"
+	case "first_output":
+		return "221"
+	case "token_usage":
+		return "141"
+	case "request_finished":
+		if data["outcome"] == "canceled" {
+			return "215"
+		}
+		if number(data["status"]) >= 400 || data["outcome"] != "completed" {
+			return "203"
+		}
+		return "78"
+	case "upstream_attempt":
+		if data["will_retry"] == true {
+			return "220"
+		}
+		return "203"
+	case "stream_aborted", "response_failed":
+		return "203"
+	}
+	return severityColor(data)
+}
+
+func severityColor(data map[string]any) string {
+	switch data["level"] {
+	case "ERROR":
+		return "203"
+	case "WARN":
+		return "220"
+	default:
+		return "117"
+	}
+}
+
+func statusColor(value any) string {
+	switch status := number(value); {
+	case status == 429:
+		return "220"
+	case status >= 400:
+		return "203"
+	case status >= 300:
+		return "215"
+	case status >= 200:
+		return "78"
+	default:
+		return "244"
+	}
 }
 
 func eventLabel(data map[string]any) string {
@@ -214,46 +277,4 @@ func logValues(data map[string]any) []string {
 		}
 	}
 	return []string{timestamp, level, eventLabel(data), model, effort, boolText(data["request_stream"]), boolText(data["upstream_sse"]), durationText(data["first_output_ms"]), durationText(data["duration_ms"]), input, output, read, write, total, reason}
-}
-
-func logDetails(entry logEntry, raw bool) []string {
-	if raw {
-		var pretty strings.Builder
-		encoder := json.NewEncoder(&pretty)
-		encoder.SetIndent("", "  ")
-		if encoder.Encode(entry.data) == nil {
-			return strings.Split(strings.TrimSpace(pretty.String()), "\n")
-		}
-		return []string{entry.raw}
-	}
-	d := entry.data
-	values := logValues(d)
-	lines := []string{"事件：" + eventLabel(d) + "；" + values[len(values)-1],
-		"请求：" + textValue(d["request_id"]), "模型：" + values[3] + "；推理强度：" + values[4],
-		"请求流式：" + values[5] + "；上游 SSE：" + values[6] + "；强制流模式：" + boolText(d["require_stream"]),
-		"首字时间：" + durationText(d["first_output_ms"]) + "；首个响应字节：" + durationText(d["first_byte_ms"]) + "；总耗时：" + durationText(d["duration_ms"]),
-		"时间从代理接收请求开始计算，包含排队。首字指首个文字、推理、工具参数或音频输出增量；未观察到则显示 —。"}
-	u, out := object(d["usage"]), map[string]any{}
-	if u != nil {
-		out = object(u["output_tokens_details"])
-	}
-	lines = append(lines, "输入合计："+numericText(u["input_tokens"])+"；输入未命中："+values[9]+"；输出："+values[10],
-		"缓存读取："+values[11]+"；缓存写入："+values[12]+"；总 Token："+values[13]+"；其中推理输出："+numericText(out["reasoning_tokens"]),
-		"缓存读写属于输入合计；输入未命中 = 输入合计 − 缓存读取（包含可能的缓存写入）。总 Token 不再重复加缓存。")
-	labels := map[string]string{"status": "HTTP 状态", "attempt": "本次尝试", "attempts": "总尝试次数", "queue_ms": "排队耗时（毫秒）", "response_header_ms": "本次等待响应头（毫秒）", "attempt_ms": "本次尝试耗时（毫秒）", "retry_delay_ms": "重试等待（毫秒）", "will_retry": "是否计划重试", "retryable": "是否可重试", "error_code": "上游错误码", "error_type": "上游错误类型", "error_hint": "限制类别线索", "reason_code": "诊断代码", "bytes_out": "转发字节数", "upstream_request_id": "上游请求 ID", "session_id": "本次启动 ID"}
-	var keys []string
-	for key := range labels {
-		if d[key] != nil && d[key] != "" {
-			keys = append(keys, key)
-		}
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		value := fmt.Sprint(d[key])
-		if _, ok := d[key].(bool); ok {
-			value = boolText(d[key])
-		}
-		lines = append(lines, labels[key]+"："+value)
-	}
-	return lines
 }

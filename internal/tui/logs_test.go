@@ -105,7 +105,7 @@ func TestTableRowsAreSingleLineSelectableAndExpandable(t *testing.T) {
 	}
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(logsModel)
-	if !m.expanded[m.entries[0].raw] || m.viewport.TotalLineCount() <= 2 {
+	if !m.expanded[m.entries[0].identity()] || m.viewport.TotalLineCount() <= 2 {
 		t.Fatal("record did not expand")
 	}
 	if !strings.Contains(m.viewport.View(), "上游连接异常") {

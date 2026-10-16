@@ -27,8 +27,26 @@ type logMessage struct {
 }
 type logTick struct{}
 type logEntry struct {
-	raw  string
-	data map[string]any
+	raw    string
+	data   map[string]any
+	id     string
+	events []logEntry
+}
+
+func (e logEntry) identity() string {
+	if e.id != "" {
+		return e.id
+	}
+	return e.raw
+}
+
+type logRowKey struct{ entryID, detail string }
+
+type logViewRow struct {
+	key, parent  logRowKey
+	entry, depth int
+	detail       logDetail
+	expandable   bool
 }
 
 type logsModel struct {
@@ -44,7 +62,11 @@ type logsModel struct {
 	err                           error
 	matched, selected, horizontal int
 	expanded                      map[string]bool
-	selectedRaw                   string
+	selectedEntry                 string
+	selectedDetail                string
+	rows                          []logViewRow
+	detailExpanded                map[logRowKey]bool
+	detailOffsets                 map[logRowKey]int
 	manualScroll                  bool
 }
 
@@ -63,7 +85,8 @@ func newLogsModel(path, title, sessionID string) logsModel {
 	search := textinput.New()
 	search.Prompt, search.CharLimit = "搜索  ", 160
 	return logsModel{path: path, title: title, sessionID: sessionID, width: 80, height: 24,
-		viewport: viewport.New(80, 18), search: search, follow: true, expanded: map[string]bool{}}
+		viewport: viewport.New(80, 18), search: search, follow: true, expanded: map[string]bool{},
+		detailExpanded: map[logRowKey]bool{}, detailOffsets: map[logRowKey]int{}}
 }
 
 func (m logsModel) Init() tea.Cmd { return readLogs(m.path, m.sessionID) }
@@ -191,26 +214,16 @@ func (m logsModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "home", "g":
 			m.follow = false
 			m.selected = 0
-			m.selectedRaw = ""
+			m.selectedEntry, m.selectedDetail = "", ""
 			m.refresh()
 		case "up", "k":
 			m.move(-1)
 		case "down", "j":
 			m.move(1)
 		case "pgup":
-			if m.selectedExpanded() {
-				m.manualScroll = true
-				m.viewport.PageUp()
-			} else {
-				m.move(-max(m.viewport.Height-1, 1))
-			}
+			m.move(-max(m.viewport.Height-1, 1))
 		case "pgdown":
-			if m.selectedExpanded() {
-				m.manualScroll = true
-				m.viewport.PageDown()
-			} else {
-				m.move(max(m.viewport.Height-1, 1))
-			}
+			m.move(max(m.viewport.Height-1, 1))
 		case "shift+up":
 			m.manualScroll = true
 			m.viewport.ScrollUp(1)
@@ -218,19 +231,13 @@ func (m logsModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.manualScroll = true
 			m.viewport.ScrollDown(1)
 		case "left", "h":
-			m.horizontal = max(0, m.horizontal-12)
-			m.renderEntries()
+			m.scrollHorizontal(-12)
 		case "right", "l":
-			m.horizontal = min(max(0, tableWidth()-max(1, m.width-8)), m.horizontal+12)
-			m.renderEntries()
+			m.scrollHorizontal(12)
 		case "enter", " ":
-			if len(m.entries) > 0 {
-				m.follow = false
-				m.manualScroll = false
-				raw := m.entries[m.selected].raw
-				m.expanded[raw] = !m.expanded[raw]
-				m.renderEntries()
-			}
+			m.toggleSelected()
+		case "backspace":
+			m.collapseOrParent()
 		}
 	}
 	return m, nil
@@ -239,73 +246,174 @@ func (m logsModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 func (m *logsModel) move(delta int) {
 	m.follow = false
 	m.manualScroll = false
-	m.selected = max(0, min(m.selected+delta, len(m.entries)-1))
-	m.selectedRaw = ""
+	m.selectRow(max(0, min(m.selected+delta, len(m.rows)-1)))
 	m.renderEntries()
 }
 
-func (m logsModel) selectedExpanded() bool {
-	return len(m.entries) > 0 && m.expanded[m.entries[m.selected].raw]
+func (m *logsModel) selectRow(index int) {
+	m.selected = index
+	if index < len(m.rows) {
+		m.selectedEntry, m.selectedDetail = m.rows[index].key.entryID, m.rows[index].key.detail
+	}
+}
+
+func (m logsModel) rowExpanded(row logViewRow) bool {
+	if row.depth == 0 {
+		return m.expanded[row.key.entryID]
+	}
+	return m.detailExpanded[row.key]
+}
+
+func (m *logsModel) toggleSelected() {
+	if len(m.rows) == 0 {
+		return
+	}
+	row := m.rows[m.selected]
+	if !row.expandable {
+		return
+	}
+	m.follow, m.manualScroll = false, false
+	if row.depth == 0 {
+		opening := !m.expanded[row.key.entryID]
+		m.expanded[row.key.entryID] = opening
+		// Show the event timeline on the first expansion of a request.
+		history := logRowKey{entryID: row.key.entryID, detail: "/history"}
+		if _, seen := m.detailExpanded[history]; opening && !seen && len(m.entries[row.entry].events) > 0 {
+			m.detailExpanded[history] = true
+		}
+	} else {
+		m.detailExpanded[row.key] = !m.detailExpanded[row.key]
+	}
+	m.renderEntries()
+}
+
+func (m *logsModel) collapseOrParent() {
+	if len(m.rows) == 0 {
+		return
+	}
+	row := m.rows[m.selected]
+	if m.rowExpanded(row) {
+		m.toggleSelected()
+		return
+	}
+	if row.depth > 0 {
+		m.follow, m.manualScroll = false, false
+		m.selectedEntry, m.selectedDetail = row.parent.entryID, row.parent.detail
+		m.renderEntries()
+	}
+}
+
+func (m *logsModel) scrollHorizontal(delta int) {
+	if len(m.rows) > 0 && m.rows[m.selected].depth > 0 {
+		row := m.rows[m.selected]
+		_, _, available := detailLayout(m.width, row.depth, row.detail.label != "")
+		limit := max(0, ansi.StringWidth(cleanLogText(row.detail.value))-available)
+		m.detailOffsets[row.key] = max(0, min(limit, m.detailOffsets[row.key]+delta))
+	} else {
+		limit := max(0, tableWidth()-max(1, m.width-8))
+		if m.raw && len(m.rows) > 0 {
+			limit = max(0, ansi.StringWidth(cleanLogText(m.entries[m.rows[m.selected].entry].raw))-max(1, m.width-8))
+		}
+		m.horizontal = max(0, min(limit, m.horizontal+delta))
+	}
+	m.renderEntries()
 }
 
 func (m *logsModel) refresh() {
 	m.entries = nil
 	retained := map[string]bool{}
-	for _, raw := range m.lines {
-		var data map[string]any
-		_ = json.Unmarshal([]byte(raw), &data)
-		level, _ := data["level"].(string)
-		if m.warnings && level != "WARN" && level != "ERROR" {
+	active := map[string]bool{}
+	for _, entry := range groupLogEntries(m.lines) {
+		if !entry.matches(m.query, m.warnings) {
 			continue
 		}
-		if m.query != "" && !strings.Contains(strings.ToLower(raw+" "+eventLabel(data)), strings.ToLower(m.query)) {
-			continue
-		}
-		m.entries = append(m.entries, logEntry{raw, data})
-		if m.expanded[raw] {
-			retained[raw] = true
+		m.entries = append(m.entries, entry)
+		id := entry.identity()
+		active[id] = true
+		if m.expanded[id] {
+			retained[id] = true
 		}
 	}
 	m.expanded = retained
+	for key := range m.detailExpanded {
+		if !active[key.entryID] {
+			delete(m.detailExpanded, key)
+		}
+	}
+	for key := range m.detailOffsets {
+		if !active[key.entryID] {
+			delete(m.detailOffsets, key)
+		}
+	}
 	m.matched = len(m.entries)
+	m.renderEntries()
+}
+
+func (m *logsModel) buildRows() {
+	m.rows = nil
+	var appendDetails func([]logDetail, int, int, logRowKey)
+	appendDetails = func(details []logDetail, entry, depth int, parent logRowKey) {
+		for _, detail := range details {
+			key := logRowKey{entryID: parent.entryID, detail: parent.detail + "/" + detail.id}
+			expandable := detailExpandable(detail, m.width, depth) || m.detailExpanded[key]
+			m.rows = append(m.rows, logViewRow{key: key, parent: parent, entry: entry, depth: depth, detail: detail, expandable: expandable})
+			if m.detailExpanded[key] {
+				if len(detail.children) > 0 {
+					appendDetails(detail.children, entry, depth+1, key)
+				} else {
+					for _, line := range detailTextLines(detail, m.width, depth+1) {
+						lineKey := logRowKey{entryID: parent.entryID, detail: key.detail + "/text/" + line.id}
+						m.rows = append(m.rows, logViewRow{key: lineKey, parent: key, entry: entry, depth: depth + 1, detail: line})
+					}
+				}
+			}
+		}
+	}
+	for i, entry := range m.entries {
+		key := logRowKey{entryID: entry.identity()}
+		m.rows = append(m.rows, logViewRow{key: key, entry: i, expandable: true})
+		if m.expanded[entry.identity()] {
+			appendDetails(entryDetails(entry, m.raw), i, 1, key)
+		}
+	}
+}
+
+func (m *logsModel) renderEntries() {
+	m.buildRows()
 	if m.follow {
-		m.selected = max(0, len(m.entries)-1)
-	} else if m.selectedRaw != "" {
-		for i, entry := range m.entries {
-			if entry.raw == m.selectedRaw {
+		for i := len(m.rows) - 1; i >= 0; i-- {
+			if m.rows[i].depth == 0 {
 				m.selected = i
 				break
 			}
 		}
-	}
-	m.selected = max(0, min(m.selected, len(m.entries)-1))
-	m.renderEntries()
-}
-
-func (m *logsModel) renderEntries() {
-	var lines []string
-	selectedStart, selectedEnd := 0, 0
-	for i, entry := range m.entries {
-		selected := i == m.selected
-		if selected {
-			selectedStart = len(lines)
-			m.selectedRaw = entry.raw
-		}
-		lines = append(lines, renderLogRow(entry, i+1, selected, m.width, m.horizontal, m.raw))
-		if m.expanded[entry.raw] {
-			for _, detail := range logDetails(entry, m.raw) {
-				wrapped := ansi.Wrap(cleanLogText(detail), max(1, m.width-3), "")
-				for _, line := range strings.Split(wrapped, "\n") {
-					lines = append(lines, ansi.Truncate("   "+line, m.width, ""))
+	} else if m.selectedEntry != "" {
+		for i, row := range m.rows {
+			if row.key.entryID == m.selectedEntry {
+				// Fall back to the parent record if a filter or mode hides the detail.
+				if row.depth == 0 || row.key.detail == m.selectedDetail {
+					m.selected = i
+				}
+				if row.key.detail == m.selectedDetail {
+					break
 				}
 			}
 		}
-		if selected {
-			selectedEnd = len(lines)
+	}
+	m.selectRow(max(0, min(m.selected, len(m.rows)-1)))
+	var lines []string
+	for i, row := range m.rows {
+		selected := i == m.selected
+		if row.depth == 0 {
+			lines = append(lines, renderLogRow(m.entries[row.entry], row.entry+1, selected, m.width, m.horizontal, m.raw))
+		} else {
+			_, _, available := detailLayout(m.width, row.depth, row.detail.label != "")
+			offset := min(m.detailOffsets[row.key], max(0, ansi.StringWidth(cleanLogText(row.detail.value))-available))
+			lines = append(lines, renderDetailRow(row.detail, row.depth, m.width, offset, selected, row.expandable, m.rowExpanded(row)))
 		}
 	}
 	if m.err != nil {
-		lines = append(lines, ansi.Truncate("无法读取日志："+cleanLogText(m.err.Error()), m.width, "…"))
+		lines = append(lines, paint(ansi.Truncate("无法读取日志："+cleanLogText(m.err.Error()), m.width, "…"), "203", false))
 	}
 	if len(lines) == 0 {
 		lines = append(lines, ansi.Truncate("本次启动暂无匹配的日志", m.width, "…"))
@@ -315,11 +423,11 @@ func (m *logsModel) renderEntries() {
 		return
 	}
 	if m.follow {
-		m.viewport.GotoBottom()
-	} else if selectedStart < m.viewport.YOffset {
-		m.viewport.SetYOffset(selectedStart)
-	} else if selectedEnd > m.viewport.YOffset+m.viewport.Height {
-		m.viewport.SetYOffset(selectedStart)
+		m.viewport.SetYOffset(max(0, m.selected-m.viewport.Height+1))
+	} else if m.selected < m.viewport.YOffset {
+		m.viewport.SetYOffset(m.selected)
+	} else if m.selected >= m.viewport.YOffset+m.viewport.Height {
+		m.viewport.SetYOffset(m.selected - m.viewport.Height + 1)
 	}
 }
 
@@ -337,7 +445,11 @@ func (m logsModel) View() string {
 	}
 	line := func(text string) string { return ansi.Truncate(text, m.width, "") }
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render(line(m.title + " · 仅本次启动"))
+	offset, scope := m.horizontal, "表格"
+	if len(m.rows) > 0 && m.rows[m.selected].depth > 0 {
+		offset, scope = m.detailOffsets[m.rows[m.selected].key], "当前行"
+	}
 	return strings.Join([]string{title, renderTableHeader(m.width, m.horizontal, m.raw), m.viewport.View(), line(filter),
-		line(fmt.Sprintf("%s · %s · %d 条 · 横移 %d", mode, follow, m.matched, m.horizontal)),
-		line("↑↓/滚轮选择 ←→横移 Enter展开 /搜索 e告警 f跟随 r原始 q退出")}, "\n")
+		line(fmt.Sprintf("%s · %s · %d 条 · %s横移 %d", mode, follow, m.matched, scope, offset)),
+		line("↑↓选择 ←→横移 Enter展开 退格返回 /搜索 e告警 f跟随 r原始 q退出")}, "\n")
 }
