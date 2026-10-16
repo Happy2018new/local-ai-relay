@@ -1,0 +1,7 @@
+/bin/
+/.runtime/
+/config.json
+/config.local.json
+*.log
+*.test
+/coverage.out

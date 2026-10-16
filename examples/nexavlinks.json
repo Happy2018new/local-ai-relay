@@ -1,0 +1,19 @@
+{
+  "listen": "127.0.0.1:8787",
+  "upstream_url": "https://www.nexavlinks.com",
+  "max_concurrent": 1,
+  "max_queue": 32,
+  "queue_timeout": "3m",
+  "min_interval": "1s",
+  "max_attempts": 5,
+  "retry_window": "3m",
+  "initial_backoff": "2s",
+  "max_backoff": "30s",
+  "response_header_timeout": "5m",
+  "stream_idle_timeout": "5m",
+  "error_body_timeout": "10s",
+  "max_request_bytes": 67108864,
+  "require_stream": true,
+  "upstream_api_key_env": "",
+  "local_api_key_env": ""
+}

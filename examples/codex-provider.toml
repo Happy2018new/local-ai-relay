@@ -1,0 +1,12 @@
+# Merge these fields into the existing provider table. Do not duplicate the table.
+# Existing authentication settings and model selection can remain unchanged.
+[model_providers.blackpixel]
+name = "blackpixel"
+base_url = "http://127.0.0.1:8787"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 900000
+capabilities = { remote_compaction = "unsupported" }
