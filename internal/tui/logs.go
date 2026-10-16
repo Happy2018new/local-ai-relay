@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
@@ -26,54 +25,53 @@ type logMessage struct {
 	lines []string
 	err   error
 }
-
 type logTick struct{}
-
-type logsModel struct {
-	path      string
-	title     string
-	width     int
-	height    int
-	viewport  viewport.Model
-	search    textinput.Model
-	searching bool
-	query     string
-	follow    bool
-	warnings  bool
-	raw       bool
-	lines     []string
-	err       error
-	matched   int
+type logEntry struct {
+	raw  string
+	data map[string]any
 }
 
-func ViewLogs(ctx context.Context, path, title string) error {
+type logsModel struct {
+	path, title, sessionID        string
+	width, height                 int
+	viewport                      viewport.Model
+	search                        textinput.Model
+	searching                     bool
+	query                         string
+	follow, warnings, raw         bool
+	lines                         []string
+	entries                       []logEntry
+	err                           error
+	matched, selected, horizontal int
+	expanded                      map[string]bool
+	selectedRaw                   string
+	manualScroll                  bool
+}
+
+func ViewLogs(ctx context.Context, path, title, sessionID string) error {
 	if path == "" {
 		return errors.New("尚未设置日志文件")
 	}
-	_, err := tea.NewProgram(newLogsModel(path, title), tea.WithOutput(os.Stderr), tea.WithAltScreen(), tea.WithContext(ctx)).Run()
+	_, err := tea.NewProgram(newLogsModel(path, title, sessionID), tea.WithOutput(os.Stderr), tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithContext(ctx)).Run()
 	if errors.Is(err, tea.ErrInterrupted) || errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil {
 		return nil
 	}
 	return err
 }
 
-func newLogsModel(path, title string) logsModel {
+func newLogsModel(path, title, sessionID string) logsModel {
 	search := textinput.New()
-	search.Prompt = "搜索  "
-	search.CharLimit = 160
-	return logsModel{path: path, title: title, width: 80, height: 24, viewport: viewport.New(80, 19), search: search, follow: true}
+	search.Prompt, search.CharLimit = "搜索  ", 160
+	return logsModel{path: path, title: title, sessionID: sessionID, width: 80, height: 24,
+		viewport: viewport.New(80, 18), search: search, follow: true, expanded: map[string]bool{}}
 }
 
-func (m logsModel) Init() tea.Cmd { return readLogs(m.path) }
-
-func readLogs(path string) tea.Cmd {
-	return func() tea.Msg {
-		lines, err := tailLog(path)
-		return logMessage{lines: lines, err: err}
-	}
+func (m logsModel) Init() tea.Cmd { return readLogs(m.path, m.sessionID) }
+func readLogs(path, sessionID string) tea.Cmd {
+	return func() tea.Msg { lines, err := tailLog(path, sessionID); return logMessage{lines, err} }
 }
 
-func tailLog(path string) ([]string, error) {
+func tailLog(path, sessionID string) ([]string, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -104,11 +102,27 @@ func tailLog(path string) ([]string, error) {
 			return nil, nil
 		}
 	}
-	text := strings.TrimRight(strings.ToValidUTF8(string(data), "?"), "\r\n")
-	if text == "" {
+	// Ignore a concurrent append's incomplete final JSON record.
+	if end := bytes.LastIndexByte(data, '\n'); end >= 0 {
+		data = data[:end]
+	} else {
 		return nil, nil
 	}
-	lines := strings.Split(text, "\n")
+	var lines []string
+	for _, raw := range strings.Split(strings.ToValidUTF8(string(data), "?"), "\n") {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		if sessionID != "" {
+			var record struct {
+				SessionID string `json:"session_id"`
+			}
+			if json.Unmarshal([]byte(raw), &record) != nil || record.SessionID != sessionID {
+				continue
+			}
+		}
+		lines = append(lines, raw)
+	}
 	if len(lines) > maxLogLines {
 		lines = lines[len(lines)-maxLogLines:]
 	}
@@ -119,7 +133,7 @@ func (m logsModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(msg.Width, 1), max(msg.Height, 1)
-		m.viewport.Width, m.viewport.Height = m.width, max(m.height-5, 1)
+		m.viewport.Width, m.viewport.Height = m.width, max(m.height-6, 1)
 		m.search.Width = max(m.width-8, 1)
 		m.refresh()
 	case logMessage:
@@ -127,7 +141,14 @@ func (m logsModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.refresh()
 		return m, tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg { return logTick{} })
 	case logTick:
-		return m, readLogs(m.path)
+		return m, readLogs(m.path, m.sessionID)
+	case tea.MouseMsg:
+		if msg.Button == tea.MouseButtonWheelUp {
+			m.move(-3)
+		}
+		if msg.Button == tea.MouseButtonWheelDown {
+			m.move(3)
+		}
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -135,8 +156,7 @@ func (m logsModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if m.searching {
 			switch msg.String() {
 			case "enter":
-				m.query = m.search.Value()
-				m.searching = false
+				m.query, m.searching = m.search.Value(), false
 				m.search.Blur()
 				m.refresh()
 			case "esc":
@@ -167,20 +187,70 @@ func (m logsModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.refresh()
 		case "end", "G":
 			m.follow = true
-			m.viewport.GotoBottom()
-		case "up", "pgup", "home", "k", "g":
+			m.refresh()
+		case "home", "g":
 			m.follow = false
-			m.viewport, _ = m.viewport.Update(msg)
-		default:
-			m.viewport, _ = m.viewport.Update(msg)
+			m.selected = 0
+			m.selectedRaw = ""
+			m.refresh()
+		case "up", "k":
+			m.move(-1)
+		case "down", "j":
+			m.move(1)
+		case "pgup":
+			if m.selectedExpanded() {
+				m.manualScroll = true
+				m.viewport.PageUp()
+			} else {
+				m.move(-max(m.viewport.Height-1, 1))
+			}
+		case "pgdown":
+			if m.selectedExpanded() {
+				m.manualScroll = true
+				m.viewport.PageDown()
+			} else {
+				m.move(max(m.viewport.Height-1, 1))
+			}
+		case "shift+up":
+			m.manualScroll = true
+			m.viewport.ScrollUp(1)
+		case "shift+down":
+			m.manualScroll = true
+			m.viewport.ScrollDown(1)
+		case "left", "h":
+			m.horizontal = max(0, m.horizontal-12)
+			m.renderEntries()
+		case "right", "l":
+			m.horizontal = min(max(0, tableWidth()-max(1, m.width-8)), m.horizontal+12)
+			m.renderEntries()
+		case "enter", " ":
+			if len(m.entries) > 0 {
+				m.follow = false
+				m.manualScroll = false
+				raw := m.entries[m.selected].raw
+				m.expanded[raw] = !m.expanded[raw]
+				m.renderEntries()
+			}
 		}
 	}
 	return m, nil
 }
 
+func (m *logsModel) move(delta int) {
+	m.follow = false
+	m.manualScroll = false
+	m.selected = max(0, min(m.selected+delta, len(m.entries)-1))
+	m.selectedRaw = ""
+	m.renderEntries()
+}
+
+func (m logsModel) selectedExpanded() bool {
+	return len(m.entries) > 0 && m.expanded[m.entries[m.selected].raw]
+}
+
 func (m *logsModel) refresh() {
-	var lines []string
-	m.matched = 0
+	m.entries = nil
+	retained := map[string]bool{}
 	for _, raw := range m.lines {
 		var data map[string]any
 		_ = json.Unmarshal([]byte(raw), &data)
@@ -188,76 +258,86 @@ func (m *logsModel) refresh() {
 		if m.warnings && level != "WARN" && level != "ERROR" {
 			continue
 		}
-		if m.query != "" && !strings.Contains(strings.ToLower(raw), strings.ToLower(m.query)) {
+		if m.query != "" && !strings.Contains(strings.ToLower(raw+" "+eventLabel(data)), strings.ToLower(m.query)) {
 			continue
 		}
-		line := raw
-		if !m.raw && data != nil {
-			line = compactLog(data)
+		m.entries = append(m.entries, logEntry{raw, data})
+		if m.expanded[raw] {
+			retained[raw] = true
 		}
-		line = strings.Map(func(r rune) rune {
-			if r < 32 || r == 127 {
-				return ' '
-			}
-			return r
-		}, ansi.Strip(line))
-		lines = append(lines, ansi.Wrap(line, m.width, ""))
-		m.matched++
 	}
-	if m.err != nil {
-		lines = append(lines, "无法读取日志: "+m.err.Error())
-	}
-	if len(lines) == 0 {
-		lines = append(lines, "暂无匹配的日志")
-	}
-	m.viewport.SetContent(strings.Join(lines, "\n"))
+	m.expanded = retained
+	m.matched = len(m.entries)
 	if m.follow {
-		m.viewport.GotoBottom()
+		m.selected = max(0, len(m.entries)-1)
+	} else if m.selectedRaw != "" {
+		for i, entry := range m.entries {
+			if entry.raw == m.selectedRaw {
+				m.selected = i
+				break
+			}
+		}
 	}
+	m.selected = max(0, min(m.selected, len(m.entries)-1))
+	m.renderEntries()
 }
 
-func compactLog(data map[string]any) string {
-	var parts []string
-	if timestamp, ok := data["time"].(string); ok {
-		if parsed, err := time.Parse(time.RFC3339Nano, timestamp); err == nil {
-			parts = append(parts, parsed.Local().Format("15:04:05"))
+func (m *logsModel) renderEntries() {
+	var lines []string
+	selectedStart, selectedEnd := 0, 0
+	for i, entry := range m.entries {
+		selected := i == m.selected
+		if selected {
+			selectedStart = len(lines)
+			m.selectedRaw = entry.raw
+		}
+		lines = append(lines, renderLogRow(entry, i+1, selected, m.width, m.horizontal, m.raw))
+		if m.expanded[entry.raw] {
+			for _, detail := range logDetails(entry, m.raw) {
+				wrapped := ansi.Wrap(cleanLogText(detail), max(1, m.width-3), "")
+				for _, line := range strings.Split(wrapped, "\n") {
+					lines = append(lines, ansi.Truncate("   "+line, m.width, ""))
+				}
+			}
+		}
+		if selected {
+			selectedEnd = len(lines)
 		}
 	}
-	for _, name := range []string{"level", "msg"} {
-		if value, ok := data[name].(string); ok {
-			parts = append(parts, value)
-		}
+	if m.err != nil {
+		lines = append(lines, ansi.Truncate("无法读取日志："+cleanLogText(m.err.Error()), m.width, "…"))
 	}
-	var keys []string
-	for key := range data {
-		if key != "time" && key != "level" && key != "msg" {
-			keys = append(keys, key)
-		}
+	if len(lines) == 0 {
+		lines = append(lines, ansi.Truncate("本次启动暂无匹配的日志", m.width, "…"))
 	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		parts = append(parts, fmt.Sprintf("%s=%v", key, data[key]))
+	m.viewport.SetContent(strings.Join(lines, "\n"))
+	if m.manualScroll && !m.follow {
+		return
 	}
-	return strings.Join(parts, "  ")
+	if m.follow {
+		m.viewport.GotoBottom()
+	} else if selectedStart < m.viewport.YOffset {
+		m.viewport.SetYOffset(selectedStart)
+	} else if selectedEnd > m.viewport.YOffset+m.viewport.Height {
+		m.viewport.SetYOffset(selectedStart)
+	}
 }
 
 func (m logsModel) View() string {
-	mode, follow, format := "全部级别", "自动跟随", "紧凑"
+	mode, follow := "全部级别", "自动跟随"
 	if m.warnings {
 		mode = "告警与错误"
 	}
 	if !m.follow {
 		follow = "已暂停"
 	}
-	if m.raw {
-		format = "原始 JSON"
-	}
-	footer := fmt.Sprintf("%s · %s · %s · %d 条", mode, follow, format, m.matched)
 	filter := "搜索  " + m.query
 	if m.searching {
 		filter = m.search.View()
 	}
 	line := func(text string) string { return ansi.Truncate(text, m.width, "") }
-	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render(line(m.title))
-	return strings.Join([]string{title, line(m.path), m.viewport.View(), line(filter), line(footer)}, "\n")
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render(line(m.title + " · 仅本次启动"))
+	return strings.Join([]string{title, renderTableHeader(m.width, m.horizontal, m.raw), m.viewport.View(), line(filter),
+		line(fmt.Sprintf("%s · %s · %d 条 · 横移 %d", mode, follow, m.matched, m.horizontal)),
+		line("↑↓/滚轮选择 ←→横移 Enter展开 /搜索 e告警 f跟随 r原始 q退出")}, "\n")
 }

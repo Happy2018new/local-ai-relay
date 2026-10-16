@@ -24,20 +24,21 @@ type Result struct {
 }
 
 type editor struct {
-	path     string
-	cfg      config.Config
-	original config.Config
-	exists   bool
-	notice   string
-	run      func(*huh.Form) error
-	legacy   credentials.Reader
+	path      string
+	cfg       config.Config
+	original  config.Config
+	exists    bool
+	notice    string
+	run       func(*huh.Form) error
+	legacy    credentials.Reader
+	sessionID string
 }
 
 func Available() bool {
 	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stderr.Fd()))
 }
 
-func Run(path, logOverride string) (Result, error) {
+func Run(path, logOverride, sessionID string) (Result, error) {
 	if !Available() {
 		return Result{}, errors.New("TUI requires an interactive terminal; run local-ai-relay -tui in Windows Terminal or another terminal")
 	}
@@ -45,6 +46,7 @@ func Run(path, logOverride string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	e.sessionID = sessionID
 	if logOverride != "" {
 		absolute, err := filepath.Abs(logOverride)
 		if err != nil {
@@ -114,7 +116,7 @@ func (e *editor) loop() (Result, error) {
 			}
 			return Result{}, nil
 		case "logs":
-			if err := ViewLogs(context.Background(), e.cfg.LogPath(e.path), "运行日志"); err != nil {
+			if err := ViewLogs(context.Background(), e.cfg.LogPath(e.path), "本次启动的日志", e.sessionID); err != nil {
 				e.notice = err.Error()
 			}
 		default:

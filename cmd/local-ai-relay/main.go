@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -41,12 +42,13 @@ func run() error {
 		return nil
 	}
 	var cfg config.Config
+	sessionID := "run-" + rand.Text()
 	interactive := *configure || flag.NFlag() == 0 && tui.Available()
 	if interactive {
 		if *check {
 			return errors.New("-tui and -check cannot be used together")
 		}
-		result, err := tui.Run(*path, *logPath)
+		result, err := tui.Run(*path, *logPath, sessionID)
 		if err != nil {
 			return err
 		}
@@ -94,7 +96,7 @@ func run() error {
 			output = io.MultiWriter(os.Stderr, logFile)
 		}
 	}
-	logger := slog.New(slog.NewJSONHandler(output, nil))
+	logger := slog.New(slog.NewJSONHandler(output, nil)).With("session_id", sessionID)
 	proxy, err := relay.New(cfg, secrets, logger)
 	if err != nil {
 		return err
@@ -115,11 +117,13 @@ func run() error {
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	logger.Info("relay_started", "version", version, "listen", listener.Addr().String(),
-		"max_concurrent", cfg.MaxConcurrent, "max_queue", cfg.MaxQueue)
+		"max_concurrent", cfg.MaxConcurrent, "max_queue", cfg.MaxQueue, "require_stream", cfg.RequireStream)
 	var viewError error
 	if interactive {
 		viewDone := make(chan error, 1)
-		go func() { viewDone <- tui.ViewLogs(ctx, *logPath, "运行中 · http://"+listener.Addr().String()) }()
+		go func() {
+			viewDone <- tui.ViewLogs(ctx, *logPath, "运行中 · http://"+listener.Addr().String(), sessionID)
+		}()
 		select {
 		case err := <-done:
 			stop()
