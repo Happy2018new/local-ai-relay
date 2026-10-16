@@ -14,6 +14,8 @@
   "error_body_timeout": "10s",
   "max_request_bytes": 67108864,
   "require_stream": true,
+  "upstream_api_key": "",
+  "local_api_key": "",
   "upstream_api_key_env": "",
   "local_api_key_env": ""
 }

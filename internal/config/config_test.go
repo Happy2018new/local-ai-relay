@@ -46,3 +46,39 @@ func TestSecretsFailClosed(t *testing.T) {
 		t.Fatalf("secrets: %+v, %v", secrets, err)
 	}
 }
+
+func TestInlineAPIKeysAndMixedSources(t *testing.T) {
+	cfg, err := Load(strings.NewReader(`{"upstream_url":"https://example.com/v1","upstream_api_key":"upstream-direct","local_api_key":"local-direct"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets, err := cfg.ResolveSecrets(nil)
+	if err != nil || secrets.UpstreamKey != "upstream-direct" || secrets.LocalKey != "local-direct" {
+		t.Fatal("inline keys did not resolve without a credential store")
+	}
+	cfg.LocalAPIKey = ""
+	cfg.LocalAPIKeyEnv = "RELAY_TEST_LOCAL_KEY"
+	t.Setenv(cfg.LocalAPIKeyEnv, "local-from-env")
+	secrets, err = cfg.ResolveSecrets(nil)
+	if err != nil || secrets.UpstreamKey != "upstream-direct" || secrets.LocalKey != "local-from-env" {
+		t.Fatal("independent key sources did not resolve")
+	}
+	for _, data := range []string{
+		`{"upstream_api_key":"private-key","upstream_api_key_env":"UPSTREAM"}`,
+		`{"upstream_api_key":"private-key","upstream_api_key_ref":"old-reference"}`,
+		`{"upstream_api_key_env":"UPSTREAM","upstream_api_key_ref":"old-reference"}`,
+		`{"local_api_key":"private-key"}`,
+		`{"upstream_api_key":"upstream","local_api_key":"private-key","local_api_key_env":"LOCAL"}`,
+		`{"upstream_api_key":"upstream","local_api_key":"private-key","local_api_key_ref":"old-reference"}`,
+		`{"upstream_api_key":"private-key\n"}`,
+		`{"upstream_api_key":"private-key\u0000"}`,
+		`{"upstream_api_key":"   "}`,
+	} {
+		_, err := Load(strings.NewReader(`{"upstream_url":"https://example.com",` + data[1:]))
+		if err == nil {
+			t.Error("invalid key configuration accepted")
+		} else if strings.Contains(err.Error(), "private-key") {
+			t.Error("API key included in validation error")
+		}
+	}
+}

@@ -60,12 +60,10 @@ func (s keyStore) Get(reference string) (string, error) {
 	}
 	return value, nil
 }
-func (s keyStore) Set(reference, value string) error { s[reference] = value; return nil }
-func (s keyStore) Delete(reference string) error     { delete(s, reference); return nil }
 
-var _ credentials.Store = keyStore{}
+var _ credentials.Reader = keyStore{}
 
-func TestCredentialReferencesResolveWithoutPlaintextInJSON(t *testing.T) {
+func TestLegacyCredentialsMigrateToEditableConfigKeys(t *testing.T) {
 	cfg := Default()
 	cfg.UpstreamURL = "https://example.com"
 	cfg.UpstreamAPIKeyRef, cfg.LocalAPIKeyRef = "upstream-test", "local-test"
@@ -74,20 +72,27 @@ func TestCredentialReferencesResolveWithoutPlaintextInJSON(t *testing.T) {
 	if err != nil || secrets.UpstreamKey != "upstream-secret" || secrets.LocalKey != "local-secret" {
 		t.Fatalf("secret resolution: %+v %v", secrets, err)
 	}
+	migrated, err := cfg.InlineLegacyKeys(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated.UpstreamAPIKeyRef != "" || migrated.LocalAPIKeyRef != "" || cfg.UpstreamAPIKeyRef == "" {
+		t.Fatal("migration did not clear references or modified its source")
+	}
 	path := filepath.Join(t.TempDir(), "config.json")
-	if err := Save(path, cfg); err != nil {
+	if err := Save(path, migrated); err != nil {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(path)
-	if strings.Contains(string(data), "upstream-secret") || strings.Contains(string(data), "local-secret") {
-		t.Fatal("plaintext secret persisted")
+	if !strings.Contains(string(data), `"upstream_api_key": "upstream-secret"`) || !strings.Contains(string(data), `"local_api_key": "local-secret"`) || strings.Contains(string(data), "_api_key_ref") {
+		t.Fatal("migrated keys were not saved in configuration")
 	}
-	cfg.UpstreamAPIKeyEnv = "UPSTREAM_KEY"
-	if cfg.Validate() == nil {
-		t.Fatal("conflicting key sources accepted")
+	loaded, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	cfg.UpstreamAPIKeyEnv, cfg.UpstreamAPIKeyRef = "", ""
-	if cfg.Validate() == nil {
-		t.Fatal("local key accepted without upstream key")
+	secrets, err = loaded.ResolveSecrets(nil)
+	if err != nil || secrets.UpstreamKey != "upstream-secret" || secrets.LocalKey != "local-secret" {
+		t.Fatal("migrated configuration still requires the credential store")
 	}
 }

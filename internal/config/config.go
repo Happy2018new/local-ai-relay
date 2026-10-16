@@ -52,11 +52,15 @@ type Config struct {
 	ErrorBodyTimeout      Duration `json:"error_body_timeout"`
 	MaxRequestBytes       int64    `json:"max_request_bytes"`
 	RequireStream         bool     `json:"require_stream"`
+	UpstreamAPIKey        string   `json:"upstream_api_key"`
+	LocalAPIKey           string   `json:"local_api_key"`
 	UpstreamAPIKeyEnv     string   `json:"upstream_api_key_env"`
 	LocalAPIKeyEnv        string   `json:"local_api_key_env"`
-	UpstreamAPIKeyRef     string   `json:"upstream_api_key_ref,omitempty"`
-	LocalAPIKeyRef        string   `json:"local_api_key_ref,omitempty"`
 	LogFile               string   `json:"log_file,omitempty"`
+
+	// Legacy references are read only for compatibility and migration.
+	UpstreamAPIKeyRef string `json:"upstream_api_key_ref,omitempty"`
+	LocalAPIKeyRef    string `json:"local_api_key_ref,omitempty"`
 }
 
 func Default() Config {
@@ -121,10 +125,26 @@ func (c Config) Validate() error {
 	if c.MaxRequestBytes < 1 || c.MaxRequestBytes > 1<<30 {
 		return errors.New("max_request_bytes must be 1..1073741824")
 	}
-	if c.UpstreamAPIKeyEnv != "" && c.UpstreamAPIKeyRef != "" || c.LocalAPIKeyEnv != "" && c.LocalAPIKeyRef != "" {
-		return errors.New("choose one key source (environment or credential store) for each API key")
+	for _, sources := range [][3]string{
+		{c.UpstreamAPIKey, c.UpstreamAPIKeyEnv, c.UpstreamAPIKeyRef},
+		{c.LocalAPIKey, c.LocalAPIKeyEnv, c.LocalAPIKeyRef},
+	} {
+		count := 0
+		for _, source := range sources {
+			if source != "" {
+				count++
+			}
+		}
+		if count > 1 {
+			return errors.New("choose one key source (config, environment, or legacy credential reference) for each API key")
+		}
+		if sources[0] != "" {
+			if err := validateKey(sources[0]); err != nil {
+				return err
+			}
+		}
 	}
-	if (c.LocalAPIKeyEnv != "" || c.LocalAPIKeyRef != "") && c.UpstreamAPIKeyEnv == "" && c.UpstreamAPIKeyRef == "" {
+	if (c.LocalAPIKey != "" || c.LocalAPIKeyEnv != "" || c.LocalAPIKeyRef != "") && c.UpstreamAPIKey == "" && c.UpstreamAPIKeyEnv == "" && c.UpstreamAPIKeyRef == "" {
 		return errors.New("local authentication requires a separate upstream key so local credentials are never forwarded")
 	}
 	return nil
@@ -139,36 +159,80 @@ func (c Config) Secrets() (Secrets, error) {
 	return c.ResolveSecrets(credentials.System{})
 }
 
-func (c Config) ResolveSecrets(store credentials.Store) (Secrets, error) {
+func (c Config) ResolveSecrets(store credentials.Reader) (Secrets, error) {
 	var secrets Secrets
 	if err := c.Validate(); err != nil {
 		return secrets, err
 	}
 	for _, item := range []struct {
-		name string
-		ref  string
-		dest *string
-	}{{c.UpstreamAPIKeyEnv, c.UpstreamAPIKeyRef, &secrets.UpstreamKey}, {c.LocalAPIKeyEnv, c.LocalAPIKeyRef, &secrets.LocalKey}} {
-		var value string
-		if item.ref != "" {
-			var err error
-			value, err = store.Get(item.ref)
-			if err != nil {
-				return secrets, fmt.Errorf("cannot read credential %q from the system credential store", item.ref)
-			}
-		} else if item.name != "" {
-			value = os.Getenv(item.name)
-		} else {
+		value string
+		name  string
+		ref   string
+		dest  *string
+	}{
+		{c.UpstreamAPIKey, c.UpstreamAPIKeyEnv, c.UpstreamAPIKeyRef, &secrets.UpstreamKey},
+		{c.LocalAPIKey, c.LocalAPIKeyEnv, c.LocalAPIKeyRef, &secrets.LocalKey},
+	} {
+		if item.value == "" && item.name == "" && item.ref == "" {
 			continue
 		}
-		value = strings.TrimSpace(value)
-		if value == "" {
-			return secrets, fmt.Errorf("configured API key is empty (environment %q, credential %q)", item.name, item.ref)
-		}
-		if strings.ContainsAny(value, "\r\n") {
-			return secrets, errors.New("configured API key contains a newline")
+		value, err := resolveKey(item.value, item.name, item.ref, store)
+		if err != nil {
+			return Secrets{}, err
 		}
 		*item.dest = value
 	}
 	return secrets, nil
+}
+
+// InlineLegacyKeys copies old credential references into editable config fields.
+// It never writes to or deletes entries from the system credential store.
+func (c Config) InlineLegacyKeys(store credentials.Reader) (Config, error) {
+	if err := c.Validate(); err != nil {
+		return Config{}, err
+	}
+	for _, item := range []struct{ value, reference *string }{
+		{&c.UpstreamAPIKey, &c.UpstreamAPIKeyRef},
+		{&c.LocalAPIKey, &c.LocalAPIKeyRef},
+	} {
+		if *item.reference == "" {
+			continue
+		}
+		value, err := resolveKey("", "", *item.reference, store)
+		if err != nil {
+			return Config{}, err
+		}
+		*item.value, *item.reference = value, ""
+	}
+	return c, nil
+}
+
+func resolveKey(value, env, reference string, store credentials.Reader) (string, error) {
+	if reference != "" {
+		var err error
+		if store == nil {
+			err = errors.New("legacy credential reader unavailable")
+		} else {
+			value, err = store.Get(reference)
+		}
+		if err != nil {
+			return "", errors.New("cannot read legacy API key; enter the key again in the TUI or replace the *_api_key_ref field with *_api_key in config")
+		}
+	} else if env != "" {
+		value = os.Getenv(env)
+	}
+	if err := validateKey(value); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(value), nil
+}
+
+func validateKey(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return errors.New("configured API key is empty")
+	}
+	if strings.ContainsAny(value, "\x00\r\n") {
+		return errors.New("configured API key contains NUL or newline characters")
+	}
+	return nil
 }

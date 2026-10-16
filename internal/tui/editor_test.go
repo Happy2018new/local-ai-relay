@@ -16,27 +16,20 @@ import (
 type memoryStore struct {
 	values map[string]string
 	fail   bool
-	failAt int
-	writes int
+	reads  int
 }
 
 func (s *memoryStore) Get(key string) (string, error) {
+	s.reads++
+	if s.fail {
+		return "", errors.New("credential backend unavailable")
+	}
 	value, ok := s.values[key]
 	if !ok {
 		return "", errors.New("missing")
 	}
 	return value, nil
 }
-func (s *memoryStore) Set(key, value string) error {
-	s.writes++
-	if s.fail || s.failAt == s.writes {
-		return errors.New("credential backend unavailable")
-	}
-	s.values[key] = value
-	return nil
-}
-func (s *memoryStore) Delete(key string) error { delete(s.values, key); return nil }
-
 func newTestEditor(t *testing.T) *editor {
 	t.Helper()
 	e, err := openEditor(filepath.Join(t.TempDir(), "config.json"))
@@ -44,25 +37,27 @@ func newTestEditor(t *testing.T) *editor {
 		t.Fatal(err)
 	}
 	e.cfg.UpstreamURL = "https://example.com"
-	e.store = &memoryStore{values: map[string]string{}}
+	e.legacy = &memoryStore{values: map[string]string{}, fail: true}
 	return e
 }
 
-func TestSaveStoresKeysAndReturnsRunnableConfiguration(t *testing.T) {
+func TestSaveWritesInlineKeysWithoutCredentialStore(t *testing.T) {
 	e := newTestEditor(t)
-	e.cfg.UpstreamAPIKeyRef, e.cfg.LocalAPIKeyRef = "pending", "pending"
-	e.pendingUpstream, e.pendingLocal = "private-upstream", "private-local"
+	e.cfg.UpstreamAPIKey, e.cfg.LocalAPIKey = "private-upstream", "private-local"
 	result, err := e.save(true)
 	if err != nil || !result.Start || !result.Saved {
 		t.Fatalf("save and start: %+v %v", result, err)
 	}
-	secrets, err := result.Config.ResolveSecrets(e.store)
+	secrets, err := result.Config.ResolveSecrets(nil)
 	if err != nil || secrets.UpstreamKey != "private-upstream" || secrets.LocalKey != "private-local" {
 		t.Fatal("persisted keys unavailable")
 	}
 	data, _ := os.ReadFile(e.path)
-	if strings.Contains(string(data), "private-") || e.dirty() {
-		t.Fatal("key leaked into configuration or editor remains dirty")
+	if !strings.Contains(string(data), `"upstream_api_key": "private-upstream"`) || !strings.Contains(string(data), `"local_api_key": "private-local"`) || e.dirty() {
+		t.Fatal("keys were not saved in configuration or editor remains dirty")
+	}
+	if e.legacy.(*memoryStore).reads != 0 {
+		t.Fatal("inline key configuration accessed system credentials")
 	}
 	loaded, err := config.LoadFile(e.path)
 	if err != nil || loaded != result.Config {
@@ -70,14 +65,12 @@ func TestSaveStoresKeysAndReturnsRunnableConfiguration(t *testing.T) {
 	}
 }
 
-func TestCredentialFailureAndSaveFailureDoNotLeakNewCredentials(t *testing.T) {
-	t.Run("credential failure", func(t *testing.T) {
+func TestLegacyMigrationAndSaveFailurePreservePreviousConfiguration(t *testing.T) {
+	t.Run("unavailable legacy credential", func(t *testing.T) {
 		e := newTestEditor(t)
-		e.cfg.UpstreamAPIKeyRef = "pending"
-		e.pendingUpstream = "private-key"
-		e.store.(*memoryStore).fail = true
+		e.cfg.UpstreamAPIKeyRef = "legacy-upstream"
 		if _, err := e.save(false); err == nil {
-			t.Fatal("credential failure ignored")
+			t.Fatal("missing legacy credential ignored")
 		}
 		if _, err := os.Stat(e.path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatal("configuration saved despite credential failure")
@@ -85,31 +78,55 @@ func TestCredentialFailureAndSaveFailureDoNotLeakNewCredentials(t *testing.T) {
 	})
 	t.Run("save failure", func(t *testing.T) {
 		e := newTestEditor(t)
+		e.cfg.UpstreamAPIKey = "previous-key"
 		if _, err := e.save(false); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Mkdir(e.path+".bak", 0700); err != nil {
 			t.Fatal(err)
 		}
-		e.cfg.UpstreamAPIKeyRef = "pending"
-		e.pendingUpstream = "private-key"
+		e.cfg.UpstreamAPIKey = "replacement-key"
 		if _, err := e.save(false); err == nil {
 			t.Fatal("file failure ignored")
 		}
-		if len(e.store.(*memoryStore).values) != 0 {
-			t.Fatal("failed save leaked credentials")
+		previous, err := config.LoadFile(e.path)
+		if err != nil || previous.UpstreamAPIKey != "previous-key" || e.cfg.UpstreamAPIKey != "replacement-key" || !e.dirty() {
+			t.Fatal("failed save discarded the draft or changed the saved configuration")
 		}
 	})
-	t.Run("second credential failure", func(t *testing.T) {
+	t.Run("migrate both legacy keys", func(t *testing.T) {
 		e := newTestEditor(t)
-		e.cfg.UpstreamAPIKeyRef, e.cfg.LocalAPIKeyRef = "pending", "pending"
-		e.pendingUpstream, e.pendingLocal = "upstream-secret", "local-secret"
-		e.store.(*memoryStore).failAt = 2
-		if _, err := e.save(false); err == nil {
-			t.Fatal("second credential failure ignored")
+		e.cfg.UpstreamAPIKeyRef, e.cfg.LocalAPIKeyRef = "old-upstream", "old-local"
+		e.legacy = &memoryStore{values: map[string]string{"old-upstream": "upstream-secret", "old-local": "local-secret"}}
+		if err := config.Save(e.path, e.cfg); err != nil {
+			t.Fatal(err)
 		}
-		if len(e.store.(*memoryStore).values) != 0 {
-			t.Fatal("partial credential transaction leaked")
+		e.original, e.exists = e.cfg, true
+		result, err := e.save(true)
+		if err != nil || result.Config.UpstreamAPIKey != "upstream-secret" || result.Config.LocalAPIKey != "local-secret" || result.Config.UpstreamAPIKeyRef != "" || result.Config.LocalAPIKeyRef != "" {
+			t.Fatal("legacy configuration was not migrated")
+		}
+		if _, err := result.Config.ResolveSecrets(nil); err != nil {
+			t.Fatal("migrated configuration still requires system credentials")
+		}
+		backup, err := config.LoadFile(e.path + ".bak")
+		if err != nil || backup.UpstreamAPIKeyRef != "old-upstream" {
+			t.Fatal("legacy configuration was not backed up")
+		}
+	})
+	t.Run("incomplete legacy migration", func(t *testing.T) {
+		e := newTestEditor(t)
+		e.cfg.UpstreamAPIKeyRef, e.cfg.LocalAPIKeyRef = "old-upstream", "missing-local"
+		e.legacy = &memoryStore{values: map[string]string{"old-upstream": "upstream-secret"}}
+		before := e.cfg
+		if _, err := e.save(false); err == nil {
+			t.Fatal("missing second legacy credential ignored")
+		}
+		if e.cfg != before {
+			t.Fatal("failed migration partially modified the draft")
+		}
+		if _, err := os.Stat(e.path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("partial migration was written to disk")
 		}
 	})
 }
@@ -131,12 +148,43 @@ func TestAPIKeyEntryIsMaskedAndDeferredUntilSave(t *testing.T) {
 		step++
 		return nil
 	}
-	var env, reference, pending string
-	if err := e.editKey("API Key", "沿用客户端认证", &env, &reference, &pending); err != nil {
+	var key, env, reference string
+	if err := e.editKey("API Key", "沿用客户端认证", &key, &env, &reference); err != nil {
 		t.Fatal(err)
 	}
-	if pending != "private-new-key" || reference != "pending" || len(e.store.(*memoryStore).values) != 0 {
+	if key != "private-new-key" || reference != "" || e.legacy.(*memoryStore).reads != 0 {
 		t.Fatal("key entry was not deferred until save")
+	}
+	if _, err := os.Stat(e.path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("key entry saved a configuration before Save was chosen")
+	}
+}
+
+func TestAPIKeyCanBePreservedReplacedAndRemoved(t *testing.T) {
+	for _, action := range []string{"preserve", "replace", "remove"} {
+		t.Run(action, func(t *testing.T) {
+			e := newTestEditor(t)
+			key, env, reference := "previous-key", "", ""
+			step := 0
+			e.run = func(form *huh.Form) error {
+				field := form.GetFocusedField()
+				field.Focus()
+				if step == 0 && action == "remove" {
+					field.Update(tea.KeyMsg{Type: tea.KeyUp})
+				} else if step == 1 && action == "replace" {
+					field.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("replacement-key")})
+				}
+				step++
+				return nil
+			}
+			if err := e.editKey("API Key", "沿用客户端认证", &key, &env, &reference); err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]string{"preserve": "previous-key", "replace": "replacement-key", "remove": ""}[action]
+			if key != want || env != "" || reference != "" {
+				t.Fatal("key edit did not apply the selected action")
+			}
+		})
 	}
 }
 

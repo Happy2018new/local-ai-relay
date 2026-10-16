@@ -2,7 +2,6 @@ package tui
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
@@ -25,15 +24,13 @@ type Result struct {
 }
 
 type editor struct {
-	path            string
-	cfg             config.Config
-	original        config.Config
-	exists          bool
-	notice          string
-	run             func(*huh.Form) error
-	store           credentials.Store
-	pendingUpstream string
-	pendingLocal    string
+	path     string
+	cfg      config.Config
+	original config.Config
+	exists   bool
+	notice   string
+	run      func(*huh.Form) error
+	legacy   credentials.Reader
 }
 
 func Available() bool {
@@ -75,7 +72,7 @@ func openEditor(path string) (*editor, error) {
 	} else if err != nil {
 		return nil, fmt.Errorf("read configuration for TUI: %w", err)
 	}
-	e := &editor{path: absolute, cfg: cfg, original: cfg, exists: exists, store: credentials.System{}}
+	e := &editor{path: absolute, cfg: cfg, original: cfg, exists: exists, legacy: credentials.System{}}
 	if e.cfg.LogFile == "" {
 		e.cfg.LogFile = filepath.Join(".runtime", "relay.log")
 	}
@@ -167,7 +164,7 @@ func (e *editor) menu(action *string) *huh.Form {
 }
 
 func (e *editor) dirty() bool {
-	return e.cfg != e.original || e.pendingUpstream != "" || e.pendingLocal != ""
+	return e.cfg != e.original
 }
 
 func (e *editor) form(groups ...*huh.Group) *huh.Form {
@@ -215,52 +212,25 @@ func (e *editor) save(start bool) (Result, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return Result{}, err
 	}
-	draft := e.cfg
-	var added []string
-	committed := false
-	defer func() {
-		if !committed {
-			for _, reference := range added {
-				_ = e.store.Delete(reference)
-			}
-		}
-	}()
-	for _, key := range []struct {
-		pending   string
-		reference *string
-		prefix    string
-	}{
-		{e.pendingUpstream, &draft.UpstreamAPIKeyRef, "upstream-"},
-		{e.pendingLocal, &draft.LocalAPIKeyRef, "local-"},
-	} {
-		if key.pending == "" {
-			continue
-		}
-		reference := key.prefix + rand.Text()
-		if err := e.store.Set(reference, key.pending); err != nil {
-			return Result{}, errors.New("无法写入系统凭据库；可改用环境变量方式配置 API Key")
-		}
-		added = append(added, reference)
-		*key.reference = reference
+	draft, err := e.cfg.InlineLegacyKeys(e.legacy)
+	if err != nil {
+		return Result{}, err
 	}
 	if start {
-		if _, err := draft.ResolveSecrets(e.store); err != nil {
+		if _, err := draft.Secrets(); err != nil {
 			return Result{}, err
 		}
 	}
 	if err := config.Save(e.path, draft); err != nil {
 		return Result{}, err
 	}
-	committed = true
 	e.cfg, e.original, e.exists = draft, draft, true
-	e.pendingUpstream, e.pendingLocal = "", ""
 	return Result{Config: draft, Saved: true, Start: start}, nil
 }
 
 func (e *editor) edit(section string) error {
 	draft := e.cfg
 	fields := &fields{}
-	pendingUpstream, pendingLocal := e.pendingUpstream, e.pendingLocal
 	var group *huh.Group
 	switch section {
 	case "connection":
@@ -335,11 +305,11 @@ func (e *editor) edit(section string) error {
 		return err
 	}
 	if section == "connection" {
-		if err := e.editKey("上游 API Key", "沿用客户端认证", &draft.UpstreamAPIKeyEnv, &draft.UpstreamAPIKeyRef, &pendingUpstream); err != nil {
+		if err := e.editKey("上游 API Key", "沿用客户端认证", &draft.UpstreamAPIKey, &draft.UpstreamAPIKeyEnv, &draft.UpstreamAPIKeyRef); err != nil {
 			return err
 		}
 	} else if section == "local" {
-		if err := e.editKey("本地 API Key", "不启用本地认证", &draft.LocalAPIKeyEnv, &draft.LocalAPIKeyRef, &pendingLocal); err != nil {
+		if err := e.editKey("本地 API Key", "不启用本地认证", &draft.LocalAPIKey, &draft.LocalAPIKeyEnv, &draft.LocalAPIKeyRef); err != nil {
 			return err
 		}
 	}
@@ -348,27 +318,26 @@ func (e *editor) edit(section string) error {
 	draft.UpstreamAPIKeyEnv = strings.TrimSpace(draft.UpstreamAPIKeyEnv)
 	draft.LocalAPIKeyEnv = strings.TrimSpace(draft.LocalAPIKeyEnv)
 	e.cfg = draft
-	e.pendingUpstream, e.pendingLocal = pendingUpstream, pendingLocal
 	return nil
 }
 
-func (e *editor) editKey(title, disabledLabel string, env, reference, pending *string) error {
+func (e *editor) editKey(title, disabledLabel string, key, env, reference *string) error {
 	mode := "disabled"
 	if *env != "" {
 		mode = "env"
-	} else if *reference != "" || *pending != "" {
-		mode = "keyring"
+	} else if *key != "" || *reference != "" {
+		mode = "config"
 	}
 	if err := e.run(e.form(huh.NewGroup(huh.NewSelect[string]().Key("key_source").Title(title).Options(
 		huh.NewOption(disabledLabel, "disabled"),
-		huh.NewOption("输入密钥 · 系统凭据库", "keyring"),
+		huh.NewOption("输入密钥 · 保存到配置文件", "config"),
 		huh.NewOption("环境变量", "env"),
 	).Value(&mode)))); err != nil {
 		return err
 	}
 	switch mode {
 	case "disabled":
-		*env, *reference, *pending = "", "", ""
+		*key, *env, *reference = "", "", ""
 	case "env":
 		name := *env
 		if err := e.run(e.form(huh.NewGroup(huh.NewInput().Key("key_env").Title("环境变量名").Value(&name).Validate(func(value string) error {
@@ -379,31 +348,28 @@ func (e *editor) editKey(title, disabledLabel string, env, reference, pending *s
 		})))); err != nil {
 			return err
 		}
-		*env, *reference, *pending = strings.TrimSpace(name), "", ""
-	case "keyring":
+		*key, *env, *reference = "", strings.TrimSpace(name), ""
+	case "config":
 		value := ""
 		placeholder := "API Key"
-		if *reference != "" || *pending != "" {
+		if *key != "" || *reference != "" {
 			placeholder = "留空保留现有密钥"
 		}
-		if err := e.run(e.form(huh.NewGroup(huh.NewInput().Key("api_key").Title(title).EchoMode(huh.EchoModePassword).Placeholder(placeholder).Value(&value).Validate(func(value string) error {
-			if strings.TrimSpace(value) == "" && *reference == "" && *pending == "" {
+		if err := e.run(e.form(huh.NewGroup(huh.NewInput().Key("api_key").Title(title).Description("保存到 " + e.path).EchoMode(huh.EchoModePassword).Placeholder(placeholder).Value(&value).Validate(func(value string) error {
+			if strings.TrimSpace(value) == "" && *key == "" && *reference == "" {
 				return errors.New("请输入 API Key")
 			}
-			if strings.ContainsAny(value, "\r\n") {
-				return errors.New("API Key 不能包含换行")
+			if strings.ContainsAny(value, "\x00\r\n") {
+				return errors.New("API Key 不能包含空字符或换行")
 			}
 			return nil
 		})))); err != nil {
 			return err
 		}
 		if value = strings.TrimSpace(value); value != "" {
-			*pending = value
+			*key, *reference = value, ""
 		}
 		*env = ""
-		if *reference == "" {
-			*reference = "pending"
-		}
 	}
 	return nil
 }
