@@ -11,11 +11,46 @@
 ```powershell
 go test ./...
 go build -trimpath -o .\bin\local-ai-relay.exe ./cmd/local-ai-relay
+.\bin\local-ai-relay.exe -tui
+```
+
+在交互终端中不带参数运行也会打开 TUI。配置保存到 `config.json`，可以选择“保存并启动”，直接进入实时日志界面。
+
+## 终端配置界面
+
+菜单提供上游、本地设置、队列、重试、超时、流模式以及日志查看。方向键选择，`Enter` 确认，输入框使用 `Tab` / `Shift+Tab` 切换。编辑时 `Ctrl+C` 放弃当前分类的修改并返回菜单；主菜单中 `Ctrl+C` 退出且不保存。
+
+- **上游与 API Key**：选择 Nexavlinks、OpenAI 或自定义 API 根地址。认证可选择沿用客户端认证、直接输入 API Key，或引用环境变量。
+- **本地设置**：设置监听地址、日志文件以及可选的本地 API Key。本地认证启用后，必须同时配置独立的上游密钥。
+- **参数编辑**：数值、时长和地址有即时校验；保存前再次检查整个配置。
+- **保存**：采用同目录临时文件替换，旧文件保留为 `.bak`。取消编辑不会写入文件或凭据库，保存时检测到外部更改会报错。
+
+直接输入的 API Key 使用掩码显示，并保存到系统凭据库：Windows Credential Manager、macOS Keychain 或 Linux Secret Service。配置文件仅保存凭据引用。修改已有密钥时留空表示保留；选择其他认证方式可取消使用该密钥。系统凭据库不可用时可以使用环境变量方式，程序不会降级为明文保存。
+
+旧凭据会保留，以便 `.bak` 中的旧引用仍可用。包含凭据引用的配置只能在能访问相应凭据库的用户环境中使用，跨机器迁移时需要重新配置密钥。
+
+“查看日志”会打开配置的日志文件；选择“保存并启动”后显示当前进程的实时日志。日志视图的操作：
+
+| 按键 | 操作 |
+| --- | --- |
+| `↑` / `↓`、`PgUp` / `PgDn` | 滚动日志，向上滚动自动暂停跟随 |
+| `f` | 暂停 / 恢复自动跟随 |
+| `End` | 跳到最新日志并恢复跟随 |
+| `e` | 切换全部级别 / WARN 与 ERROR |
+| `/`、`Enter` | 输入搜索内容并应用；空搜索取消过滤 |
+| `r` | 切换紧凑视图 / 原始 JSON |
+| `q` / `Esc` | 关闭日志视图；运行视图中会同时停止当前代理 |
+
+查看器每次读取最多末尾 1 MiB、显示最多 500 条记录，不会将整个日志文件载入内存。相对日志路径以配置文件所在目录为基准，命令行 `-log-file` 参数优先。
+
+保留非交互方式，适用于脚本或后台启动：
+
+```powershell
 .\bin\local-ai-relay.exe -config .\examples\nexavlinks.json -check
 .\bin\local-ai-relay.exe -config .\examples\nexavlinks.json -log-file .\.runtime\relay.log
 ```
 
-这个示例指向 `https://www.nexavlinks.com`，监听 `127.0.0.1:8787`。通用配置 `config.example.json` 指向官方 API 的 `/v1` 根路径。两种配置均不含密钥。
+这个示例指向 `https://www.nexavlinks.com`，监听 `127.0.0.1:8787`。通用配置 `config.example.json` 指向官方 API 的 `/v1` 根路径。两种配置均不含密钥。编辑特定配置使用 `-tui -config 路径`。
 
 默认将客户端的 `Authorization` 转交给配置好的上游。不要把上游 URL 改成不受信任的服务。
 
@@ -101,7 +136,10 @@ JSON 配置会与默认值合并，未知字段报错。时长必须是 `"1s"`�
 | `max_request_bytes` | `67108864` | 请求大小上限，同时应用于压缩前后 |
 | `require_stream` | `true` | 要求 Responses 请求包含 `stream: true`，且成功响应为 SSE |
 | `upstream_api_key_env` | 空 | 从指定环境变量读取上游密钥并替换客户端认证头 |
-| `local_api_key_env` | 空 | 可选的本地 Bearer 密钥；必须同时设置上游密钥变量 |
+| `local_api_key_env` | 空 | 可选的本地 Bearer 密钥变量；必须同时配置独立的上游密钥 |
+| `upstream_api_key_ref` | 空 | TUI 保存的上游系统凭据引用，不与对应环境变量同时使用 |
+| `local_api_key_ref` | 空 | TUI 保存的本地系统凭据引用，不与对应环境变量同时使用 |
+| `log_file` | 空 | 日志文件；相对配置文件目录解析，TUI 默认 `.runtime/relay.log` |
 
 上游路径映射示例：
 
@@ -124,7 +162,7 @@ JSON 配置会与默认值合并，未知字段报错。时长必须是 `"1s"`�
 }
 ```
 
-启动代理前，通过当前终端环境注入这两个变量。代理只从环境读取值，JSON 中不要填写密钥本身。启用本地认证后，API 和 `/status` 需要本地 Bearer token，`/healthz` 仍公开；本地密钥不会发给上游。已配置但不存在的环境变量会使启动失败。
+启动代理前，通过当前终端环境注入这两个变量。该方式从环境读取值；也可以在 TUI 直接输入并保存到系统凭据库。JSON 中不要填写密钥本身。启用本地认证后，API 和 `/status` 需要本地 Bearer token，`/healthz` 仍公开；本地密钥不会发给上游。已配置但不存在的环境变量或凭据会使启动失败。
 
 `config.json`、`config.local.json`、`.runtime/`、`bin/` 和日志文件已加入 `.gitignore`。
 

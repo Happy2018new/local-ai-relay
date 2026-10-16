@@ -15,6 +15,8 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	}
 	for _, data := range []string{
 		`{"upstream_url":"https://example.com","listen":"0.0.0.0:8787"}`,
+		`{"upstream_url":"https://example.com","listen":"127.0.0.1:70000"}`,
+		`{"upstream_url":"https://example.com","listen":"127.0.0.1:abc"}`,
 		`{"upstream_url":"https://key@example.com"}`,
 		`{"upstream_url":"https://example.com?key=secret"}`,
 		`{"upstream_url":"https://example.com","max_attempts":0}`,
@@ -32,6 +34,7 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 
 func TestSecretsFailClosed(t *testing.T) {
 	cfg := Default()
+	cfg.UpstreamURL = "https://example.com"
 	cfg.UpstreamAPIKeyEnv = "RELAY_TEST_UPSTREAM_KEY"
 	t.Setenv(cfg.UpstreamAPIKeyEnv, "")
 	if _, err := cfg.Secrets(); err == nil {

@@ -8,8 +8,11 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Happy2018new/local-ai-relay/internal/credentials"
 )
 
 type Duration time.Duration
@@ -29,6 +32,10 @@ func (d *Duration) UnmarshalJSON(data []byte) error {
 
 func (d Duration) Value() time.Duration { return time.Duration(d) }
 
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(d.Value().String())
+}
+
 type Config struct {
 	Listen                string   `json:"listen"`
 	UpstreamURL           string   `json:"upstream_url"`
@@ -47,6 +54,9 @@ type Config struct {
 	RequireStream         bool     `json:"require_stream"`
 	UpstreamAPIKeyEnv     string   `json:"upstream_api_key_env"`
 	LocalAPIKeyEnv        string   `json:"local_api_key_env"`
+	UpstreamAPIKeyRef     string   `json:"upstream_api_key_ref,omitempty"`
+	LocalAPIKeyRef        string   `json:"local_api_key_ref,omitempty"`
+	LogFile               string   `json:"log_file,omitempty"`
 }
 
 func Default() Config {
@@ -79,6 +89,13 @@ func (c Config) Validate() error {
 	if err != nil || port == "" {
 		return errors.New("listen must be a loopback host:port, for example 127.0.0.1:8787")
 	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 0 || portNumber > 65535 {
+		return errors.New("listen port must be an integer from 0 to 65535")
+	}
+	if strings.ContainsAny(c.LogFile, "\x00\r\n") {
+		return errors.New("log_file must not contain NUL or newline characters")
+	}
 	if host != "localhost" && (net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback()) {
 		return errors.New("listen must use localhost or a loopback IP address")
 	}
@@ -104,8 +121,11 @@ func (c Config) Validate() error {
 	if c.MaxRequestBytes < 1 || c.MaxRequestBytes > 1<<30 {
 		return errors.New("max_request_bytes must be 1..1073741824")
 	}
-	if c.LocalAPIKeyEnv != "" && c.UpstreamAPIKeyEnv == "" {
-		return errors.New("local_api_key_env requires upstream_api_key_env so local credentials are never forwarded")
+	if c.UpstreamAPIKeyEnv != "" && c.UpstreamAPIKeyRef != "" || c.LocalAPIKeyEnv != "" && c.LocalAPIKeyRef != "" {
+		return errors.New("choose one key source (environment or credential store) for each API key")
+	}
+	if (c.LocalAPIKeyEnv != "" || c.LocalAPIKeyRef != "") && c.UpstreamAPIKeyEnv == "" && c.UpstreamAPIKeyRef == "" {
+		return errors.New("local authentication requires a separate upstream key so local credentials are never forwarded")
 	}
 	return nil
 }
@@ -116,20 +136,37 @@ type Secrets struct {
 }
 
 func (c Config) Secrets() (Secrets, error) {
+	return c.ResolveSecrets(credentials.System{})
+}
+
+func (c Config) ResolveSecrets(store credentials.Store) (Secrets, error) {
 	var secrets Secrets
+	if err := c.Validate(); err != nil {
+		return secrets, err
+	}
 	for _, item := range []struct {
 		name string
+		ref  string
 		dest *string
-	}{{c.UpstreamAPIKeyEnv, &secrets.UpstreamKey}, {c.LocalAPIKeyEnv, &secrets.LocalKey}} {
-		if item.name == "" {
+	}{{c.UpstreamAPIKeyEnv, c.UpstreamAPIKeyRef, &secrets.UpstreamKey}, {c.LocalAPIKeyEnv, c.LocalAPIKeyRef, &secrets.LocalKey}} {
+		var value string
+		if item.ref != "" {
+			var err error
+			value, err = store.Get(item.ref)
+			if err != nil {
+				return secrets, fmt.Errorf("cannot read credential %q from the system credential store", item.ref)
+			}
+		} else if item.name != "" {
+			value = os.Getenv(item.name)
+		} else {
 			continue
 		}
-		value := strings.TrimSpace(os.Getenv(item.name))
+		value = strings.TrimSpace(value)
 		if value == "" {
-			return secrets, fmt.Errorf("required environment variable %q is empty", item.name)
+			return secrets, fmt.Errorf("configured API key is empty (environment %q, credential %q)", item.name, item.ref)
 		}
 		if strings.ContainsAny(value, "\r\n") {
-			return secrets, fmt.Errorf("environment variable %q contains a newline", item.name)
+			return secrets, errors.New("configured API key contains a newline")
 		}
 		*item.dest = value
 	}
